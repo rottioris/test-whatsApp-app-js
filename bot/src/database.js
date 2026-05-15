@@ -12,7 +12,6 @@ if (!fs.existsSync(dbDir)) {
 let db = null;
 
 async function initDatabase() {
-    // Modo de escritura inmediata y WAL para concurrencia
     db = new Database(DB_PATH);
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
@@ -25,7 +24,8 @@ async function initDatabase() {
             precio REAL DEFAULT 0,
             activo INTEGER DEFAULT 1,
             orden INTEGER DEFAULT 0,
-            imagen TEXT
+            imagen TEXT,
+            mensaje_completado TEXT
         );
 
         CREATE TABLE IF NOT EXISTS clientes (
@@ -40,10 +40,12 @@ async function initDatabase() {
             cliente_id INTEGER NOT NULL,
             servicio_id INTEGER,
             servicio_nombre TEXT NOT NULL,
+            servicio_precio REAL DEFAULT 0,
             descripcion TEXT,
             estado TEXT DEFAULT 'pendiente',
             notas TEXT,
             extra_cost REAL DEFAULT 0,
+            imagenes TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE CASCADE,
@@ -66,65 +68,32 @@ async function initDatabase() {
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
 
-        -- Índices para optimización
+        CREATE TABLE IF NOT EXISTS ticket_extras (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id INTEGER NOT NULL,
+            descripcion TEXT NOT NULL,
+            costo REAL DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (ticket_id) REFERENCES tickets(id) ON DELETE CASCADE
+        );
+
         CREATE INDEX IF NOT EXISTS idx_clientes_telefono ON clientes(telefono);
         CREATE INDEX IF NOT EXISTS idx_tickets_cliente ON tickets(cliente_id);
         CREATE INDEX IF NOT EXISTS idx_tickets_estado ON tickets(estado);
     `);
 
-    const serviciosCount = db.prepare('SELECT COUNT(*) as count FROM servicios').get().count;
-    if (serviciosCount === 0) {
-        const insertServicio = db.prepare('INSERT INTO servicios (nombre, descripcion, precio, orden) VALUES (?, ?, ?, ?)');
-        const servicios = [
-            ['ASESORÍA', 'Consultas sobre armados de PC y equipos', 0, 1],
-            ['MANTENIMIENTO', 'Solución de errores hardware y software', 0, 2],
-            ['LIMPIEZA', 'Limpieza de componentes + cambio de pasta térmica', 0, 3],
-            ['ENSAMBLES', 'Armado de PC nuevo', 0, 4],
-            ['INSTALACIÓN', 'Sistemas operativos y software', 0, 5],
-            ['COMBOS', 'Paquetes de servicios', 0, 6]
-        ];
-        servicios.forEach(s => insertServicio.run(s));
-    }
-
-    const configCount = db.prepare('SELECT COUNT(*) as count FROM configuraciones').get().count;
-    if (configCount === 0) {
-        const insertConfig = db.prepare('INSERT INTO configuraciones (clave, valor) VALUES (?, ?)');
-        const configs = [
-            ['bienvenida', '👋 *Bienvenido a TDP - Servicios Técnicos*\n\nEstamos aquí para ayudarte con el mantenimiento, reparación y ensamble de tus equipos.'],
-            ['menu_servicios', '¿En qué podemos ayudarte hoy?\n\nSelecciona una opción escribiendo el *número* o el *nombre*:'],
-            ['aceptacion', '✅ *Excelente elección.*\n\nPara generar tu ticket y asignarte un técnico, por favor envíanos:\n\n1️⃣ Tu *Nombre completo*\n2️⃣ Una *Descripción breve* del problema'],
-            ['pedir_datos', 'Por favor, proporciónanos:\n\n📝 *Nombre:*\n🔧 *Problema del equipo:*'],
-            ['confirmacion_ticket', '🎉 *¡Ticket creado con éxito!*\n\nUn técnico revisará tu caso pronto. Te notificaremos por aquí cuando tu equipo esté listo para entrega.'],
-            ['notificacion_entrega', '📢 *¡Tu equipo está listo!*\n\nHola, te informamos que el servicio técnico de tu equipo ha finalizado con éxito y ya puedes pasar por él.\n\n📍 *Ubicación:* [Tu Dirección Aquí]\n⏰ *Horario:* Lunes a Viernes 9am - 6pm\n\nSi tienes dudas, puedes escribir:\n1️⃣ Ver Ubicación\n2️⃣ Horarios de atención\n3️⃣ Hablar con un técnico']
-        ];
-        configs.forEach(c => insertConfig.run(c));
-    }
-
-    console.log('[DB] Base de datos persistente lista en:', DB_PATH);
     return db;
 }
 
-function queryAll(sql, params = []) {
-    return db.prepare(sql).all(params);
-}
-
-function queryOne(sql, params = []) {
-    return db.prepare(sql).get(params);
-}
-
+function queryAll(sql, params = []) { return db.prepare(sql).all(params); }
+function queryOne(sql, params = []) { return db.prepare(sql).get(params); }
 function run(sql, params = []) {
     const info = db.prepare(sql).run(params);
     return { lastInsertRowid: info.lastInsertRowid, changes: info.changes };
 }
 
-function getServicios() {
-    return queryAll('SELECT * FROM servicios WHERE activo = 1 ORDER BY orden');
-}
-
-function getConfig(clave) {
-    return queryOne('SELECT * FROM configuraciones WHERE clave = ?', [clave]);
-}
-
+function getServicios(all = false) { return queryAll('SELECT * FROM servicios ' + (all ? '' : 'WHERE activo = 1 ') + 'ORDER BY orden'); }
+function getConfig(clave) { return queryOne('SELECT * FROM configuraciones WHERE clave = ?', [clave]); }
 function setConfig(clave, valor, imagen = null) {
     const exists = queryOne('SELECT id FROM configuraciones WHERE clave = ?', [clave]);
     if (exists) {
@@ -136,7 +105,6 @@ function setConfig(clave, valor, imagen = null) {
 
 function getOrCreateCliente(telefono, nombre = null) {
     let cliente = queryOne('SELECT * FROM clientes WHERE telefono = ?', [telefono]);
-
     if (!cliente) {
         const result = run('INSERT INTO clientes (telefono, nombre) VALUES (?, ?)', [telefono, nombre]);
         cliente = { id: result.lastInsertRowid, telefono, nombre };
@@ -144,77 +112,58 @@ function getOrCreateCliente(telefono, nombre = null) {
         run('UPDATE clientes SET nombre = ? WHERE id = ?', [nombre, cliente.id]);
         cliente.nombre = nombre;
     }
-
     return cliente;
 }
 
-function createTicket(clienteId, servicioNombre, descripcion, servicioId = null) {
-    const result = run('INSERT INTO tickets (cliente_id, servicio_id, servicio_nombre, descripcion, estado) VALUES (?, ?, ?, ?, ?)',
-        [clienteId, servicioId, servicioNombre, descripcion, 'pendiente']);
-
-    return { id: result.lastInsertRowid, cliente_id: clienteId, servicio_nombre: servicioNombre, descripcion, estado: 'pendiente' };
+function createTicket(clienteId, servicioNombre, descripcion, servicioId = null, imagenes = null, servicioPrecio = 0) {
+    const result = run('INSERT INTO tickets (cliente_id, servicio_id, servicio_nombre, servicio_precio, descripcion, estado, imagenes) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [clienteId, servicioId, servicioNombre, servicioPrecio, descripcion, 'pendiente', imagenes]);
+    return { id: result.lastInsertRowid, cliente_id: clienteId, servicio_nombre: servicioNombre, servicio_precio: servicioPrecio, descripcion, estado: 'pendiente', imagenes };
 }
+
+function getTicketExtras(ticketId) { return queryAll('SELECT * FROM ticket_extras WHERE ticket_id = ? ORDER BY created_at ASC', [ticketId]); }
+function addTicketExtra(ticketId, descripcion, costo) { return run('INSERT INTO ticket_extras (ticket_id, descripcion, costo) VALUES (?, ?, ?)', [ticketId, descripcion, costo]); }
+function deleteTicketExtra(id) { return run('DELETE FROM ticket_extras WHERE id = ?', [id]); }
 
 function getTickets() {
     return queryAll(`
         SELECT t.*, c.telefono, c.nombre as cliente_nombre, t.servicio_nombre as servicio,
-               COALESCE(s.precio, 0) as servicio_precio
+               COALESCE((SELECT SUM(costo) FROM ticket_extras WHERE ticket_id = t.id), 0) as total_extras
         FROM tickets t
         LEFT JOIN clientes c ON t.cliente_id = c.id
-        LEFT JOIN servicios s ON t.servicio_id = s.id
         ORDER BY t.created_at DESC
     `);
 }
 
 function updateTicketDetails(ticketId, data) {
-    const { estado, notas, extra_cost } = data;
-    run("UPDATE tickets SET estado = ?, notas = ?, extra_cost = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", 
-        [estado, notas, extra_cost, ticketId]);
+    const { estado, notas } = data;
+    run("UPDATE tickets SET estado = ?, notas = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [estado, notas, ticketId]);
     return getTicketById(ticketId);
 }
 
 function updateTicketEstado(ticketId, estado) {
     run("UPDATE tickets SET estado = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [estado, ticketId]);
-    return queryOne('SELECT * FROM tickets WHERE id = ?', [ticketId]);
+    return getTicketById(ticketId);
 }
 
 function addLog(tipo, contenido, telefono) {
-    try {
-        run('INSERT INTO logs (tipo, contenido, telefono) VALUES (?, ?, ?)', [tipo, contenido, telefono]);
-    } catch (e) {
-        console.error('[DB] Error adding log:', e.message);
-    }
+    try { run('INSERT INTO logs (tipo, contenido, telefono) VALUES (?, ?, ?)', [tipo, contenido, telefono]); } catch (e) {}
 }
 
-function getLogs(limit = 100) {
-    return queryAll('SELECT * FROM logs ORDER BY created_at DESC LIMIT ?', [limit]);
-}
+function getLogs(limit = 100) { return queryAll('SELECT * FROM logs ORDER BY created_at DESC LIMIT ?', [limit]); }
 
 function getTicketById(id) {
     return queryOne(`
-        SELECT t.*, c.telefono, c.nombre as cliente_nombre, t.servicio_nombre as servicio,
-               COALESCE(s.precio, 0) as servicio_precio
+        SELECT t.*, c.telefono, c.nombre as cliente_nombre, t.servicio_nombre as servicio
         FROM tickets t
         LEFT JOIN clientes c ON t.cliente_id = c.id
-        LEFT JOIN servicios s ON t.servicio_id = s.id
         WHERE t.id = ?
     `, [id]);
 }
 
 module.exports = {
-    initDatabase,
-    queryAll,
-    queryOne,
-    run,
-    getServicios,
-    getConfig,
-    setConfig,
-    getOrCreateCliente,
-    createTicket,
-    getTickets,
-    updateTicketDetails,
-    updateTicketEstado,
-    addLog,
-    getLogs,
-    getTicketById
+    initDatabase, queryAll, queryOne, run, getServicios, getConfig, setConfig,
+    getOrCreateCliente, createTicket, getTickets, updateTicketDetails,
+    updateTicketEstado, addLog, getLogs, getTicketById, getTicketExtras,
+    addTicketExtra, deleteTicketExtra
 };
