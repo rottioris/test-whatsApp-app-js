@@ -68,25 +68,32 @@ class FlowManager {
 
     async handleInicio(telefono, session) {
         session.estado = ESTADOS.MENU;
-        const bienvenida = await db.getConfig('bienvenida') || { valor: '👋 *Bienvenido a TDP*', imagen: null };
-        const introMenu = await db.getConfig('menu_servicios') || { valor: 'Selecciona un servicio:', imagen: null };
-        const servicios = await db.getServicios();
+        const bienvenida = await db.getConfig('bienvenida') || { valor: '👋 *Bienvenido a Lumio*', imagen: null };
+        const introMenu = await db.getConfig('menu_servicios') || { valor: '¿En qué podemos ayudarte hoy?', imagen: null };
+        const modCombos = await db.getConfig('mod_combos');
+        
+        let servicios = await db.getServicios();
+        if (modCombos && modCombos.valor === 'false') {
+            servicios = servicios.filter(s => !s.nombre.toLowerCase().includes('combo'));
+        }
         
         let menuStr = `${bienvenida.valor}\n\n${introMenu.valor}\n\n`;
-        
-        // Solo agregar la lista si el introMenu no parece tenerla ya
-        if (!introMenu.valor.includes('1️⃣')) {
-            servicios.forEach((s, i) => {
-                menuStr += `${i + 1}️⃣ *${s.nombre}*\n`;
-            });
-            menuStr += `\n_Escribe el número de la opción deseada._`;
-        }
+        servicios.forEach((s, i) => {
+            const emoji = s.nombre.toLowerCase().includes('combo') ? '📦' : '🛠️';
+            menuStr += `${i + 1}️⃣ ${emoji} *${s.nombre}*\n`;
+        });
+        menuStr += `\n_Responde con el número de la opción._`;
         
         return { text: menuStr, image: bienvenida.imagen };
     }
 
     async handleMenu(telefono, session, text) {
-        const servicios = await db.getServicios();
+        let servicios = await db.getServicios();
+        const modCombos = await db.getConfig('mod_combos');
+        if (modCombos && modCombos.valor === 'false') {
+            servicios = servicios.filter(s => !s.nombre.toLowerCase().includes('combo'));
+        }
+        
         const index = parseInt(text) - 1;
         let servicio = null;
         
@@ -127,7 +134,7 @@ class FlowManager {
         }
     }
 
-    async handleDatos(telefono, session, text) {
+    async handleDatos(jid, session, text) {
         // Si no tenemos nombre, el primer mensaje es el nombre
         if (!session.nombre) {
             session.nombre = text;
@@ -139,20 +146,25 @@ class FlowManager {
         session.descripcionProblema = text;
 
         try {
-            const cliente = await db.getOrCreateCliente(telefono, session.nombre);
+            // Extraer número limpio (solo dígitos antes del @)
+            const numeroLimpio = jid.split('@')[0].split(':')[0];
+            
+            const cliente = await db.getOrCreateCliente(numeroLimpio, session.nombre);
             const ticket = await db.createTicket(
                 cliente.id, 
                 session.servicio.nombre, 
                 session.descripcionProblema,
-                session.servicio.id
+                session.servicio.id,
+                null, // imagenes
+                session.servicio.precio || 0
             );
 
-            await db.addLog('ticket', `Ticket #${ticket.id} creado: ${session.servicio.nombre}`, telefono);
+            await db.addLog('ticket', `Ticket #${ticket.id} creado: ${session.servicio.nombre}`, jid);
 
-            const confirmacion = await db.getConfig('confirmacion_ticket');
-            this.resetSession(telefono);
+            const confirmacion = await db.getConfig('confirmacion_ticket') || { valor: '✅ *Ticket creado con éxito.*', imagen: null };
+            this.resetSession(jid);
             
-            const responseText = `${confirmacion.valor}\n\n*Ticket ID:* #${ticket.id}\n*Servicio:* ${session.servicio.nombre}`;
+            const responseText = `${confirmacion.valor}\n\n*ID:* #${ticket.id}\n*Estado:* Pendiente\n*Soporte:* Lumio Tech`;
             return { text: responseText, image: confirmacion.imagen };
         } catch (error) {
             console.error('Error creando ticket:', error);

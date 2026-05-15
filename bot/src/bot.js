@@ -1,10 +1,11 @@
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 const QRCode = require('qrcode');
 const path = require('path');
+const fs = require('fs');
 
-const SESSION_DIR = process.env.SESSION_DIR || './session';
+const SESSION_DIR = process.env.SESSION_DIR || path.join(__dirname, '../../bot/session');
 
 let sock = null;
 let qrCodeImage = null;
@@ -22,30 +23,32 @@ function getConnectionStatus() {
 
 async function generateQRImage(qrText) {
     try {
-        const dataUrl = await QRCode.toDataURL(qrText, {
+        return await QRCode.toDataURL(qrText, {
             width: 300,
             margin: 2,
-            color: {
-                dark: '#000000',
-                light: '#ffffff'
-            }
+            color: { dark: '#000000', light: '#ffffff' }
         });
-        return dataUrl;
     } catch (err) {
-        console.error('[Bot] Error generando QR:', err);
+        console.error('[Bot] ❌ Error generando imagen QR:', err);
         return null;
     }
 }
 
 async function createBot(onMessage, onQR, onConnectionChange) {
+    if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
+
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+
+    console.log('[Bot] 🔌 Iniciando conexión con WhatsApp...');
 
     sock = makeWASocket({
         auth: state,
-        printQRInTerminal: false,
+        printQRInTerminal: true, // También en terminal para depurar
         logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome'),
-        keepAliveIntervalMs: 30000
+        browser: Browsers.macOS('Desktop'), // Más estable para vinculación
+        keepAliveIntervalMs: 30000,
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 0
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -54,39 +57,38 @@ async function createBot(onMessage, onQR, onConnectionChange) {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
+            console.log('[Bot] 📱 Nuevo código QR recibido');
             connectionStatus = 'qr';
-            const qrImage = await generateQRImage(qr);
-            qrCodeImage = qrImage;
-            onQR && onQR(qrImage);
-            console.log('[Bot] QR generado - Escanea con WhatsApp');
+            qrCodeImage = await generateQRImage(qr);
+            if (onQR) onQR(qrCodeImage);
+            if (onConnectionChange) onConnectionChange('qr');
         }
 
         if (connection === 'close') {
-            const reason = (lastDisconnect?.error)?.output?.statusCode;
-            const shouldReconnect = reason !== DisconnectReason.loggedOut;
-
-            console.log(`[Bot] Conexión cerrada. Razón: ${reason}, Reintentando: ${shouldReconnect}`);
+            const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
+            console.log(`[Bot] ⚠️ Conexión cerrada. Razón: ${reason}`);
             
             connectionStatus = 'disconnected';
             qrCodeImage = null;
-            onConnectionChange && onConnectionChange('disconnected');
+            deviceInfo = null;
+            if (onConnectionChange) onConnectionChange('disconnected');
 
-            if (shouldReconnect) {
+            if (reason !== DisconnectReason.loggedOut) {
+                console.log('[Bot] 🔄 Intentando reconexión automática...');
                 setTimeout(() => createBot(onMessage, onQR, onConnectionChange), 5000);
+            } else {
+                console.log('[Bot] 🚪 Sesión cerrada por el usuario.');
             }
         } else if (connection === 'open') {
+            console.log('[Bot] ✅ Conexión establecida con éxito');
             connectionStatus = 'connected';
             qrCodeImage = null;
-            
-            // Capturar info del dispositivo
             deviceInfo = {
-                name: sock.user.name || 'WhatsApp Web',
+                name: sock.user.name || 'Lumio Bot',
                 id: sock.user.id.split(':')[0],
-                platform: sock.browserDescription ? sock.browserDescription[0] : 'Desconocida'
+                platform: 'Lumio Dashboard'
             };
-
-            onConnectionChange && onConnectionChange('connected');
-            console.log(`[Bot] ✅ Conectado como: ${deviceInfo.name} (${deviceInfo.id})`);
+            if (onConnectionChange) onConnectionChange('connected');
         }
     });
 
@@ -94,27 +96,28 @@ async function createBot(onMessage, onQR, onConnectionChange) {
         for (const msg of messages) {
             if (!msg.message || msg.key.fromMe) continue;
             
-            // ID único para evitar duplicados en ráfagas
             const msgId = msg.key.id;
             if (messageCache.has(msgId)) continue;
             messageCache.add(msgId);
-            setTimeout(() => messageCache.delete(msgId), 10000); // Limpiar después de 10s
+            setTimeout(() => messageCache.delete(msgId), 10000);
 
-            const telefono = msg.key.remoteJid;
+            const jid = msg.key.remoteJid;
             const texto = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
 
             if (texto.trim()) {
-                console.log(`[Bot] Mensaje de ${telefono}: ${texto.substring(0, 50)}`);
-                const respuesta = await onMessage(telefono, texto);
-
+                // Notificar "escribiendo"
+                await sock.sendPresenceUpdate('composing', jid);
+                const respuesta = await onMessage(jid, texto);
+                
                 if (respuesta) {
+                    await new Promise(r => setTimeout(r, 1000)); // Simular humano
                     if (typeof respuesta === 'object') {
-                        await sendMessage(telefono, respuesta.text, respuesta.image);
+                        await sendMessage(jid, respuesta.text, respuesta.image);
                     } else {
-                        await sendMessage(telefono, respuesta);
+                        await sendMessage(jid, respuesta);
                     }
-                    console.log(`[Bot] Respuesta enviada a ${telefono}`);
                 }
+                await sock.sendPresenceUpdate('paused', jid);
             }
         }
     });
@@ -122,72 +125,68 @@ async function createBot(onMessage, onQR, onConnectionChange) {
     return sock;
 }
 
-async function sendMessage(telefono, mensaje, imagen = null) {
+async function sendMessage(jid, mensaje, imagen = null) {
     if (sock && connectionStatus === 'connected') {
-        if (imagen) {
-            let imageSource;
-            // Si es una ruta local del sistema (empieza por /home o dashboard/public)
-            if (imagen.startsWith('/') || imagen.startsWith('dashboard')) {
-                const fs = require('fs');
-                const fullPath = imagen.startsWith('/') ? imagen : path.join(__dirname, '../../', imagen);
-                if (fs.existsSync(fullPath)) {
-                    imageSource = { url: fullPath }; // Baileys soporta file paths locales en url
+        try {
+            if (imagen) {
+                let imageSource;
+                if (imagen.startsWith('/') || imagen.startsWith('dashboard')) {
+                    const fullPath = imagen.startsWith('/') ? imagen : path.join(__dirname, '../../', imagen);
+                    imageSource = fs.existsSync(fullPath) ? { url: fullPath } : { url: imagen };
                 } else {
-                    console.error('[Bot] Imagen local no encontrada:', fullPath);
-                    // Intentar como URL por si acaso
                     imageSource = { url: imagen };
                 }
+                await sock.sendMessage(jid, { image: imageSource, caption: mensaje });
             } else {
-                imageSource = { url: imagen };
+                await sock.sendMessage(jid, { text: mensaje });
             }
-
-            await sock.sendMessage(telefono, { 
-                image: imageSource, 
-                caption: mensaje 
-            });
-        } else {
-            await sock.sendMessage(telefono, { text: mensaje });
+        } catch (e) {
+            console.error('[Bot] ❌ Error enviando mensaje:', e.message);
         }
     }
 }
 
 async function disconnectBot() {
+    console.log('[Bot] 🗑️ Eliminando sesión actual...');
     if (sock) {
-        try {
-            await sock.logout();
-        } catch (e) {
-            console.error('[Bot] Error al cerrar sesión:', e);
-            sock.end(undefined);
-        }
+        try { await sock.logout(); } catch (e) { try { sock.end(undefined); } catch (err) {} }
         sock = null;
-        connectionStatus = 'disconnected';
-        qrCodeImage = null;
-        deviceInfo = null;
-        
-        // Limpiar carpeta de sesión para asegurar que pida QR nuevo
-        const fs = require('fs');
-        if (fs.existsSync(SESSION_DIR)) {
-            try {
-                fs.rmSync(SESSION_DIR, { recursive: true, force: true });
-                fs.mkdirSync(SESSION_DIR, { recursive: true });
-            } catch (e) { console.error('[Bot] Error limpiando sesión:', e); }
+    }
+    connectionStatus = 'disconnected';
+    qrCodeImage = null;
+    deviceInfo = null;
+    
+    // Limpiar carpeta de sesión de forma segura
+    if (fs.existsSync(SESSION_DIR)) {
+        const files = fs.readdirSync(SESSION_DIR);
+        for (const file of files) {
+            try { fs.unlinkSync(path.join(SESSION_DIR, file)); } catch (e) {}
         }
     }
 }
 
 async function reconnectBot(onMessage, onQR, onConnectionChange) {
     if (sock) {
-        sock.end(undefined);
+        try { sock.end(undefined); } catch (e) {}
+        sock = null;
     }
     connectionStatus = 'disconnected';
     qrCodeImage = null;
-    await createBot(onMessage, onQR, onConnectionChange);
+    await new Promise(r => setTimeout(r, 1000));
+    return await createBot(onMessage, onQR, onConnectionChange);
 }
 
-module.exports = {
-    createBot,
-    sendMessage,
-    disconnectBot,
-    getConnectionStatus,
-    reconnectBot
-};
+async function requestPairingCode(phoneNumber) {
+    if (connectionStatus === 'connected') throw new Error('Bot ya conectado');
+    if (!sock) throw new Error('El bot se está iniciando, espera 5 segundos...');
+    
+    try {
+        const code = await sock.requestPairingCode(phoneNumber.replace(/[^0-9]/g, ''));
+        return code;
+    } catch (e) {
+        console.error('[Bot] ❌ Error en Pairing Code:', e.message);
+        throw new Error('WhatsApp rechazó la solicitud. Intenta de nuevo en 1 minuto.');
+    }
+}
+
+module.exports = { createBot, sendMessage, disconnectBot, getConnectionStatus, reconnectBot, requestPairingCode };
