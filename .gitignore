@@ -7,3 +7,4 @@ session/
 .DS_Store
 dist/
 build/
+dashboard/public/uploads/
