@@ -64,8 +64,8 @@ async function start() {
                 },
                 (qr) => io.emit('qr_update', qr),
                 (status) => {
-                    io.emit('connection_status', { status });
-                    // Si se conecta, forzar limpieza de QR en el cliente
+                    const fullStatus = bot.getConnectionStatus();
+                    io.emit('connection_status', fullStatus);
                     if (status === 'connected') io.emit('qr_update', null);
                 }
             );
@@ -82,17 +82,33 @@ async function start() {
     app.get('/api/tickets', (req, res) => res.json(db.getTickets()));
 
     app.get('/api/tickets/:id', (req, res) => {
-        const t = db.getTicketById(parseInt(req.params.id));
-        t ? res.json(t) : res.status(404).json({ error: 'No encontrado' });
+        const ticketId = parseInt(req.params.id);
+        const t = db.getTicketById(ticketId);
+        if (!t) return res.status(404).json({ error: 'No encontrado' });
+        const extras = db.getTicketExtras(ticketId);
+        res.json({ ...t, extras });
+    });
+
+    app.post('/api/tickets/:id/extras', (req, res) => {
+        const { descripcion, costo } = req.body;
+        db.addTicketExtra(parseInt(req.params.id), descripcion, parseFloat(costo) || 0);
+        res.json({ success: true });
+    });
+
+    app.delete('/api/extras/:id', (req, res) => {
+        db.deleteTicketExtra(parseInt(req.params.id));
+        res.json({ success: true });
     });
 
     app.post('/api/tickets', (req, res) => {
-        const { telefono, nombre, servicio_id, descripcion } = req.body;
+        const { telefono, nombre, servicio_id, descripcion, imagenes, precio_manual } = req.body;
         const servicio = db.queryOne('SELECT * FROM servicios WHERE id = ?', [servicio_id]);
         if (!servicio) return res.status(400).json({ error: 'Servicio no válido' });
         
         const cliente = db.getOrCreateCliente(telefono, nombre);
-        const ticket = db.createTicket(cliente.id, servicio.nombre, descripcion, servicio.id);
+        const precio = precio_manual !== undefined && precio_manual !== '' ? parseFloat(precio_manual) : (servicio.precio || 0);
+        
+        const ticket = db.createTicket(cliente.id, servicio.nombre, descripcion, servicio.id, imagenes, precio);
         
         io.emit('ticket_actualizado', ticket);
         res.json(ticket);
@@ -137,12 +153,24 @@ async function start() {
         res.json({ success: true });
     });
 
-    app.get('/api/servicios', (req, res) => res.json(db.getServicios()));
+    app.get('/api/servicios', (req, res) => res.json(db.getServicios(true)));
+
+    app.post('/api/servicios', (req, res) => {
+        const { nombre, descripcion, precio, activo, imagen, mensaje_completado } = req.body;
+        const result = db.run('INSERT INTO servicios (nombre, descripcion, precio, activo, imagen, mensaje_completado) VALUES (?, ?, ?, ?, ?, ?)',
+            [nombre, descripcion, precio, activo ? 1 : 0, imagen, mensaje_completado]);
+        res.json({ id: result.lastInsertRowid, success: true });
+    });
 
     app.put('/api/servicios/:id', (req, res) => {
         const { nombre, descripcion, precio, activo, imagen, mensaje_completado } = req.body;
         db.run('UPDATE servicios SET nombre=?, descripcion=?, precio=?, activo=?, imagen=?, mensaje_completado=? WHERE id=?',
             [nombre, descripcion, precio, activo ? 1 : 0, imagen, mensaje_completado, parseInt(req.params.id)]);
+        res.json({ success: true });
+    });
+
+    app.delete('/api/servicios/:id', (req, res) => {
+        db.run('DELETE FROM servicios WHERE id=?', [parseInt(req.params.id)]);
         res.json({ success: true });
     });
 
@@ -161,6 +189,15 @@ async function start() {
 
     app.get('/api/logs', (req, res) => res.json(db.getLogs(parseInt(req.query.limit) || 50)));
 
+    app.post('/api/bot/logout', (req, res) => {
+        bot.disconnectBot().then(() => {
+            io.emit('connection_status', { status: 'disconnected', qr: null, device: null });
+            // Forzar un reinicio limpio después del logout
+            botStart();
+            res.json({ success: true });
+        }).catch(e => res.status(500).json({ error: e.message }));
+    });
+
     app.get('/api/stats', (req, res) => {
         const tickets = db.getTickets();
         const now = new Date();
@@ -177,7 +214,7 @@ async function start() {
         );
         
         const ingresosHoy = completadosHoy.reduce((sum, t) => {
-            return sum + (t.servicio_precio || 0) + (t.extra_cost || 0);
+            return sum + (t.servicio_precio || 0) + (t.total_extras || 0);
         }, 0);
 
         res.json({ 
@@ -204,6 +241,15 @@ async function start() {
         }).catch(e => res.status(500).json({ error: e.message }));
     });
 
+    app.post('/api/bot/pairing-code', (req, res) => {
+        const { telefono } = req.body;
+        if (!telefono) return res.status(400).json({ error: 'Falta teléfono' });
+        
+        bot.requestPairingCode(telefono)
+            .then(code => res.json({ code }))
+            .catch(e => res.status(500).json({ error: e.message }));
+    });
+
     app.post('/api/bot/reconnect', (req, res) => {
         bot.reconnectBot(
             async (telefono, mensaje) => {
@@ -215,11 +261,26 @@ async function start() {
         .catch(e => res.status(500).json({ error: e.message }));
     });
 
+    app.post('/api/bot/simulate', async (req, res) => {
+        const { telefono, mensaje } = req.body;
+        if (!mensaje) return res.status(400).json({ error: 'Mensaje vacío' });
+        
+        try {
+            const respuesta = await flowManager.handleMessage(telefono || 'Simulador', mensaje);
+            res.json({ respuesta });
+        } catch (e) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
     // Socket
     io.on('connection', (socket) => {
-        console.log('[Socket] Cliente conectado');
-        // Enviar estado actual al conectar
-        socket.emit('connection_status', bot.getConnectionStatus());
+        const status = bot.getConnectionStatus();
+        console.log('[Socket] 👤 Cliente conectado. Estado actual:', status.status);
+        
+        // Enviar estado inmediatamente al conectar
+        socket.emit('connection_status', status);
+        if (status.qr) socket.emit('qr_update', status.qr);
     });
 
     setInterval(() => {
